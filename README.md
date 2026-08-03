@@ -16,8 +16,7 @@ Frida Gum + QBDI 指令级 trace agent，输出三文件格式（`docs/TraceForm
     └── MemoryAccess → rw.log（内存读写 + hexdump）
 ```
 
-嵌套 VM 方案沿袭 `defer/qdbi_demo/vm.cpp`：只有目标函数自身的指令走 QBDI，
-内部调用的外部函数由 QBDI ExecBroker 原生执行，回跳后继续插桩。
+嵌套 VM 方案只有目标函数自身的指令走 QBDI，内部调用的外部函数由 QBDI ExecBroker 原生执行，回跳后继续插桩。
 
 ## 文件
 
