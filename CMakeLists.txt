@@ -5,6 +5,9 @@ project(qbdi_trace)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 生成 compile_commands.json（位于构建目录），供 clangd / ccls 等使用
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # 路径配置（可通过 -D 覆盖）
 set(QBDI_HOME ${QBDI_HOME} CACHE PATH "QBDI Android 包根目录 (包含 local/ 子目录)")
 if(NOT QBDI_HOME)

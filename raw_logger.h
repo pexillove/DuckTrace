@@ -16,34 +16,38 @@
 #include <cstddef>
 #include <cstdint>
 
-class RawMemoryLogger {
-public:
-    RawMemoryLogger();
-    ~RawMemoryLogger();
+class RawMemoryLogger
+{
+    public:
+	RawMemoryLogger();
+	~RawMemoryLogger();
 
-    // 打开输出文件（O_CREAT | O_TRUNC），分配匿名 mmap 缓存
-    // 返回 0 成功，负值失败
-    int init(const char *path);
+	// 打开输出文件（O_CREAT | O_TRUNC），分配匿名 mmap 缓存
+	// 返回 0 成功，负值失败
+	int init(const char *path);
 
-    // 追加数据到缓存；缓存放不下时自动落盘。线程安全由调用方保证。
-    void writeCached(const char *buf, size_t len);
+	// 追加数据到缓存；缓存放不下时自动落盘。线程安全由调用方保证。
+	void writeCached(const char *buf, size_t len);
 
-    // 强制把缓存写盘
-    void flush();
+	// 强制把缓存写盘
+	void flush();
 
-    // 关闭文件、释放缓存
-    void close();
+	// 关闭文件、释放缓存
+	void close();
 
-    // 已写入文件的总字节数
-    uint64_t offset() const { return offset_; }
+	// 已写入文件的总字节数
+	uint64_t offset() const
+	{
+		return offset_;
+	}
 
-private:
-    int fd_;
-    char *cache_;       // 匿名 mmap 缓存
-    size_t cacheSize_;
-    size_t used_;
-    uint64_t offset_;   // 文件累计写入字节数
-    bool inited_;
+    private:
+	int fd_;
+	char *cache_; // 匿名 mmap 缓存
+	size_t cacheSize_;
+	size_t used_;
+	uint64_t offset_; // 文件累计写入字节数
+	bool inited_;
 };
 
 // 三个全局 logger（trace_impl 初始化）

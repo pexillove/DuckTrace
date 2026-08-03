@@ -44,12 +44,14 @@ int vmtrace_unhook(void *targetAddress);
 void vmtrace_unhook_all(void);
 
 // 按模块名 + 导出函数名 hook
-int vmtrace_hook_by_name(const char *moduleName, const char *functionName,
-                         const char *logTag, int useQBDI, int traceOnce);
+int vmtrace_hook_by_name(const char *moduleName,
+	const char *functionName,
+	const char *logTag,
+	int useQBDI,
+	int traceOnce);
 
 // 按模块名 + 偏移 hook
-int vmtrace_hook_by_offset(const char *moduleName, uint64_t offset,
-                           const char *logTag, int useQBDI, int traceOnce);
+int vmtrace_hook_by_offset(const char *moduleName, uint64_t offset, const char *logTag, int useQBDI, int traceOnce);
 
 // ============================================================================
 // 直接调用

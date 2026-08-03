@@ -16,8 +16,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QDBI_HOME="${QDBI_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)/usr}"
 
-# Android NDK
-NDK="${NDK:-/home/kali/Tools/Trace/NDK}"
+# Android NDK（默认 <Trace>/NDK，与 code/ 同级；可通过 NDK=xxx 覆盖）
+NDK="${NDK:-$(cd "$SCRIPT_DIR/../../.." && pwd)/NDK}"
 TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 CXX="$TOOLCHAIN/aarch64-linux-android29-clang++"
 if [ ! -x "$CXX" ]; then
