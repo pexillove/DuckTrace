@@ -479,8 +479,8 @@ static QBDI::VMAction trace_postinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr
 	append_reg_json(wb, ci.writes, gpr, fpr);
 	writes_json[wb.len] = '\0';
 
-	// SVC 注解：第 7 列（syscall 参数展开），无则留空
-	std::string note;
+	// 第 7 列 note：恒为 JSON 对象（无注解时 {}，svc 行是 syscall 记录）
+	std::string note = "{}";
 	auto sIt = ts->syscallNotes.find(inst->address);
 	if (sIt != ts->syscallNotes.end()) {
 		note = std::move(sIt->second);
@@ -638,10 +638,12 @@ static QBDI::VMAction trace_svc(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr, QBD
 	unsigned int nr = (unsigned int)(gpr->x8 & 0xFFFFFFFF);
 	const char *name = syscall_name(nr);
 
+	// 生成 JSON 注解：{"syscall":"read","args":["0x1","0x7fd2dd3370",...]}
+	// args 用十六进制字符串保 0x（JSON 数字不允许 0x 前缀），int(x,16) 取回数值
 	char s_raw[256];
 	Buf s(s_raw, sizeof(s_raw));
 	if (name != nullptr) {
-		s.appendf("syscall %s(0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx)",
+		s.appendf("{\"syscall\":\"%s\",\"args\":[\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\"]}",
 			name,
 			(unsigned long long)gpr->x0,
 			(unsigned long long)gpr->x1,
@@ -650,7 +652,7 @@ static QBDI::VMAction trace_svc(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr, QBD
 			(unsigned long long)gpr->x4,
 			(unsigned long long)gpr->x5);
 	} else {
-		s.appendf("syscall_%u(0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx)",
+		s.appendf("{\"syscall\":\"syscall_%u\",\"args\":[\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\"]}",
 			nr,
 			(unsigned long long)gpr->x0,
 			(unsigned long long)gpr->x1,
