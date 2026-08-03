@@ -334,6 +334,36 @@ static uint64_t reg_ref_value(const QBDI::GPRState *gpr, const QBDI::FPRState *f
 	return 0;
 }
 
+// 把一组寄存器拼成 JSON 对象：{"x2":"0x1234","x3":"0x5678"}；空向量输出 {}。
+// 字段只含 [a-z0-9]（寄存器名）与 0x[0-9a-f]（值），无需 JSON 转义；
+// 若未来把任意字符串塞进来，必须先加转义，否则破坏此不变式。
+static void append_reg_json(Buf &b, const std::vector<RegVal> &regs)
+{
+	b.append("{");
+	for (size_t i = 0; i < regs.size(); i++) {
+		if (i != 0) {
+			b.append(",");
+		}
+		b.appendf("\"%s\":\"0x%llx\"", regs[i].name.c_str(), (unsigned long long)regs[i].value);
+	}
+	b.append("}");
+}
+
+// writes 版：RegRef 只有名字，POSTINST 时从 gpr 取结果值
+static void append_reg_json(Buf &b, const std::vector<RegRef> &regs,
+	const QBDI::GPRState *gpr, const QBDI::FPRState *fpr)
+{
+	b.append("{");
+	for (size_t i = 0; i < regs.size(); i++) {
+		if (i != 0) {
+			b.append(",");
+		}
+		b.appendf("\"%s\":\"0x%llx\"", regs[i].name.c_str(),
+			(unsigned long long)reg_ref_value(gpr, fpr, regs[i], true));
+	}
+	b.append("}");
+}
+
 // ============================================================================
 // QBDI 回调
 // ============================================================================
@@ -436,47 +466,37 @@ static QBDI::VMAction trace_postinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr
 	CachedInst ci = std::move(it->second);
 	ts->cache.erase(it);
 
-	// ---- code.log ----
+	// ---- code.log（TSV 7 列，见 docs/TraceFormat.md）----
+	// reads/writes 是 JSON 对象列；addr/offset/insn/reads/writes 补最小宽度空格，
+	// cat/less 直接对齐（超长溢出只破该行视觉，tab 仍在，结构不坏）。
+	char reads_json[512];
+	Buf rb(reads_json, sizeof(reads_json));
+	append_reg_json(rb, ci.reads);
+	reads_json[rb.len] = '\0';
+
+	char writes_json[512];
+	Buf wb(writes_json, sizeof(writes_json));
+	append_reg_json(wb, ci.writes, gpr, fpr);
+	writes_json[wb.len] = '\0';
+
+	// SVC 注解：第 7 列（syscall 参数展开），无则留空
+	std::string note;
+	auto sIt = ts->syscallNotes.find(inst->address);
+	if (sIt != ts->syscallNotes.end()) {
+		note = std::move(sIt->second);
+		ts->syscallNotes.erase(sIt);
+	}
+
 	char raw_line[2048];
 	Buf line(raw_line, sizeof(raw_line));
-	line.appendf("%llx: 0x%llx  [0x%llx]  \"%s\"",
+	line.appendf("%llx\t0x%-12llx\t0x%-8llx\t%-40s\t%-28s\t%-28s\t%s",
 		(unsigned long long)ci.lineNum,
 		(unsigned long long)inst->address,
 		(unsigned long long)ci.offset,
-		ci.disasm.c_str());
-
-	if (!ci.reads.empty()) {
-		line.appendf("  R{");
-		bool first = true;
-		for (const auto &r : ci.reads) {
-			if (!first) {
-				line.append(", ");
-			}
-			line.appendf("%s=0x%llx", r.name.c_str(), (unsigned long long)r.value);
-			first = false;
-		}
-		line.append("}");
-	}
-	if (!ci.writes.empty()) {
-		line.appendf("  W{");
-		bool first = true;
-		for (const auto &ref : ci.writes) {
-			if (!first) {
-				line.append(", ");
-			}
-			line.appendf("%s=0x%llx",
-				ref.name.c_str(),
-				(unsigned long long)reg_ref_value(gpr, fpr, ref, true));
-			first = false;
-		}
-		line.append("}");
-	}
-	// SVC 注解：追在行尾（; 注释形式，不破坏主字段解析）
-	auto sIt = ts->syscallNotes.find(inst->address);
-	if (sIt != ts->syscallNotes.end()) {
-		line.appendf("  ;%s", sIt->second.c_str());
-		ts->syscallNotes.erase(sIt);
-	}
+		ci.disasm.c_str(),
+		reads_json,
+		writes_json,
+		note.c_str());
 	raw_line[line.len] = '\0';
 	raw_logger_write_cached(g_raw_logger, raw_line, line.len);
 	raw_logger_write_cached(g_raw_logger, "\n", 1);
@@ -496,14 +516,15 @@ static QBDI::VMAction trace_postinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr
 
 		char a_raw[160];
 		Buf aline(a_raw, sizeof(a_raw));
+		// rw.log 索引行（TSV：line \t r/w \t base±offset），后面跟 hexdump
 		if (diff >= 0) {
-			aline.appendf("%llx: (%s)(0x%llx+0x%llx)",
+			aline.appendf("%llx\t%s\t0x%llx+0x%llx",
 				(unsigned long long)ci.lineNum,
 				rw,
 				(unsigned long long)base,
 				(unsigned long long)diff);
 		} else {
-			aline.appendf("%llx: (%s)(0x%llx-0x%llx)",
+			aline.appendf("%llx\t%s\t0x%llx-0x%llx",
 				(unsigned long long)ci.lineNum,
 				rw,
 				(unsigned long long)base,
@@ -557,7 +578,11 @@ static QBDI::VMAction trace_transfer_call(QBDI::VMInstanceRef vm,
 
 	char b_raw[512];
 	Buf bline(b_raw, sizeof(b_raw));
-	bline.appendf("%llx: [0x%llx][0]: %s", (unsigned long long)ts->currentLine, (unsigned long long)target, name);
+	// bl.log 索引行（TSV：line \t target \t symbol），后面跟 hexdump
+	bline.appendf("%llx\t0x%llx\t%s",
+		(unsigned long long)ts->currentLine,
+		(unsigned long long)target,
+		name);
 	b_raw[bline.len] = '\0';
 	raw_logger_write_cached(g_bl_logger, b_raw, bline.len);
 	raw_logger_write_cached(g_bl_logger, "\n", 1);

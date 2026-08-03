@@ -11,7 +11,7 @@ Frida Gum + QBDI 指令级 trace agent，输出三文件格式（`docs/TraceForm
 └── libtrace.so
     ├── Gum interceptor hook 目标函数（attach listener 或 replace）
     ├── hook 命中 → 新建 QBDI VM，从函数入口 run 到 LR
-    ├── PREINST/POSTINST → code.log（汇编 + R{读}/W{写} 寄存器）
+    ├── PREINST/POSTINST → code.log（汇编 + reads/writes 两列 JSON 寄存器值）
     ├── EXEC_TRANSFER_CALL → bl.log（外部调用 + 目标 hexdump）
     └── MemoryAccess → rw.log（内存读写 + hexdump）
 ```
@@ -132,8 +132,8 @@ logcat 过滤用 `duck` 标签（`adb logcat -s duck` 或 `adb logcat | grep duc
   `/data/local/tmp` 写权限，不要写那里。
 - `EXEC_TRANSFER_CALL` 的调用目标在 `GPRState->pc`（AArch64），不是 `lr`。
 - SVC 指令 QBDI 无法执行，已注册 mnemonic 回调兜底（原生执行）；同时在
-  PREINST 读 `x8`(syscall 号)+`x0-x5`(参数) 生成注解，追在 code.log 的 SVC
-  行尾，如 `...  "svc #0x0"  ;syscall read(0x1,0x7fd...,0x40,...)`。
+  PREINST 读 `x8`(syscall 号)+`x0-x5`(参数) 生成注解，放在 code.log 的 SVC
+  行第 7 列（note），如 `...\tsvc #0x0\t...\t...\tread(0x1,0x7fd...,0x40,...)`。
 - **专用大栈**：目标函数被调用时 app 线程栈往往已近耗尽（真机实测 hook 点仅剩
   ~0x60-0x110 字节余量），trace 机制自身的 C++ 栈帧会把栈顶穿 guard page 崩掉。
   因此整个 trace worker 用 `trace_run_on_stack`（AArch64 asm thunk）切到 8MB 专用栈，
