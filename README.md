@@ -98,6 +98,12 @@ logcat 过滤用 `duck` 标签（`adb logcat -s duck` 或 `adb logcat | grep duc
   再给 QBDI 执行分配一块独立大栈（`QBDI::allocateVirtualStack`）。
   **限制**：目标函数在独立大栈上执行，靠栈传参（第 8 个及以后参数）的函数读不到
   真实参数（读到的 0）；绝大多数 ≤7 寄存器参数函数不受影响。
+- **并发触发**：专用栈是单块全局 mmap，`run_trace_on_big_stack` 在切栈**之前**拿
+  `g_exec_mutex`（recursive），抢锁失败的线程阻塞在调用方自己的栈上，不进专用栈。
+  不要把锁挪到切栈之后——多个线程并发切到同一个 stackTop 会互相覆盖
+  `trace_run_on_stack` 槽位，先执行完的线程在 asm epilogue 读到错误地址返回（必崩）。
 - attach 模式：QBDI 嵌套执行 + 原生再执行各一份，外部副作用会重复；
   要单份副作用用 `vmtrace_hook_replace`。
-- 多会话共享同一份行号计数器（`g_line_num`），保证三文件索引全局唯一。
+- 多会话共享同一份行号计数器（`g_line_num`），保证三文件索引全局唯一；
+  打印行号用 `%llx`（64 位），别截断成 32 位——累计执行超过 2^32 条指令会回绕，
+  三文件索引重复。

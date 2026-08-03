@@ -331,6 +331,13 @@ static QBDI::VMAction trace_preinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
     ci.lineNum = g_line_num.fetch_add(1);
     ci.offset = inst->address - ts->baseAddr;
     ci.disasm = inst->disassembly ? inst->disassembly : "";
+    // QBDI/capstone 反汇编带前导空格，剥掉让引号内紧跟汇编（"stp ..." 而非 "    stp ..."）
+    {
+        size_t start = ci.disasm.find_first_not_of(" \t");
+        if (start != std::string::npos && start > 0) {
+            ci.disasm = ci.disasm.substr(start);
+        }
+    }
     ci.memBase = 0;
     ci.haveMemBase = false;
 
@@ -412,7 +419,7 @@ static QBDI::VMAction trace_postinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr
     // ---- code.log ----
     char raw_line[2048];
     Buf line(raw_line, sizeof(raw_line));
-    line.appendf("%x: 0x%llx  [0x%llx]  \"%s\"", (unsigned)ci.lineNum,
+    line.appendf("%llx: 0x%llx  [0x%llx]  \"%s\"", (unsigned long long)ci.lineNum,
                  (unsigned long long)inst->address, (unsigned long long)ci.offset,
                  ci.disasm.c_str());
 
@@ -467,10 +474,10 @@ static QBDI::VMAction trace_postinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr
         char a_raw[160];
         Buf aline(a_raw, sizeof(a_raw));
         if (diff >= 0) {
-            aline.appendf("%x: (%s)(0x%llx+0x%llx)", (unsigned)ci.lineNum, rw,
+            aline.appendf("%llx: (%s)(0x%llx+0x%llx)", (unsigned long long)ci.lineNum, rw,
                           (unsigned long long)base, (unsigned long long)diff);
         } else {
-            aline.appendf("%x: (%s)(0x%llx-0x%llx)", (unsigned)ci.lineNum, rw,
+            aline.appendf("%llx: (%s)(0x%llx-0x%llx)", (unsigned long long)ci.lineNum, rw,
                           (unsigned long long)base, (unsigned long long)(-diff));
         }
         a_raw[aline.len] = '\0';
@@ -514,7 +521,7 @@ static QBDI::VMAction trace_transfer_call(QBDI::VMInstanceRef vm, const QBDI::VM
 
     char b_raw[512];
     Buf bline(b_raw, sizeof(b_raw));
-    bline.appendf("%x: [0x%llx][0]: %s", (unsigned)ts->currentLine,
+    bline.appendf("%llx: [0x%llx][0]: %s", (unsigned long long)ts->currentLine,
                   (unsigned long long)target, name);
     b_raw[bline.len] = '\0';
     raw_logger_write_cached(g_bl_logger, b_raw, bline.len);
@@ -591,13 +598,15 @@ static QBDI::VMAction trace_svc(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
 // QBDI 嵌套执行核心
 // ============================================================================
 
-// 串行化 trace 会话：同一时刻只允许一个嵌套 VM 在跑
-static std::mutex g_exec_mutex;
+// 串行化 trace 会话：同一时刻只允许一个嵌套 VM 在跑。
+// recursive：run_trace_on_big_stack 切栈前先锁（防多线程并发切到同一个共享
+// 专用栈互相踩踏），executeWithQBDI 里还会再锁一次，故需要可重入。
+static std::recursive_mutex g_exec_mutex;
 
 // 用 QBDI 从 target 执行到 lr，输入/输出状态都通过 gpr/fpr 进出。
 // 返回函数返回值（x0）。
 static uint64_t executeWithQBDI(void *targetAddress, QBDI::GPRState *gpr, QBDI::FPRState *fpr) {
-    std::lock_guard<std::mutex> lock(g_exec_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_exec_mutex);
     ensure_loggers();
 
     Dl_info info;
@@ -851,8 +860,13 @@ static uint64_t trace_worker(void *rawArg) {
     return execute_with_qbdi_from_gum(c->target, c->inCtx, c->outCtx);
 }
 
-// 在专用大栈上跑 trace worker（大栈分配失败时退回当前栈直接跑）
+// 在专用大栈上跑 trace worker（大栈分配失败时退回当前栈直接跑）。
+// 必须先拿 g_exec_mutex 再切栈：专用栈是单块全局 mmap，若并发触发的多个线程
+// 都在拿锁之前切到同一个 stackTop，后到线程的 trace_run_on_stack 槽位会覆盖
+// 正在执行线程的槽位，执行完的线程会从错误地址返回（直接崩）。锁在切栈前获取，
+// 抢锁失败的线程阻塞在调用方自己的栈上，不会进专用栈。
 static uint64_t run_trace_on_big_stack(const TraceRunCtx &c) {
+    std::lock_guard<std::recursive_mutex> lock(g_exec_mutex);
     uint64_t stackTop = ensure_trace_stack_top();
     if (stackTop != 0) {
         // 函数指针转 void*：POSIX 上实现定义但可用
