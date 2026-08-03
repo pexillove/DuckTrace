@@ -7,7 +7,7 @@ Frida Gum + QBDI 指令级 trace agent，输出三文件格式（`docs/TraceForm
 ```
 目标进程 (Android AArch64)
 ├── frida 注入
-│   └── ../trace.js — 加载 libQBDI.so + libtrace.so，定位目标函数，启动 hook
+│   └── ./trace.js — 加载 libQBDI.so + libtrace.so，定位目标函数，启动 hook
 └── libtrace.so
     ├── Gum interceptor hook 目标函数（attach listener 或 replace）
     ├── hook 命中 → 新建 QBDI VM，从函数入口 run 到 LR
@@ -36,6 +36,49 @@ grep "#define __NR_" $NDK/sysroot/usr/include/aarch64-linux-android/asm/unistd_6
   | sed -E 's/#define __NR_([a-z0-9_]+)[[:space:]]+([0-9]+)/  { \2, "\1" },/' \
   | sort -t'{' -k2 -n > syscall_names.inc
 ```
+
+## 环境搭建
+
+本 agent 只依赖 3 个构建期第三方组件 + 1 个部署工具，全部来自官方 release 包，开箱即编：
+
+| 组件 | 用途 | 版本 |
+|------|------|------|
+| Android NDK | 交叉编译工具链 | 我自己使用 r29 |
+| QBDI | DBI 引擎（AArch64 插桩） | 0.12.1 · `QBDI-0.12.1-android-AARCH64.tar.gz` |
+| frida-gum devkit | hook 目标函数（Gum Interceptor） | 较新版本 · `frida-gum-devkit-*-android-arm64.tar.xz` |
+| frida-tools | 部署/驱动（运行时，可选） | 与设备上 frida-server 版本一致 |
+
+> frida-gum devkit 用的是稳定的 Gum Interceptor C API（attach/replace/revert），
+> 近几年任意版本都能直接链接，不必和 frida-server 版本强绑定。
+
+### 目录布局
+
+解压后按 `build.sh` 的默认路径摆放（相对 `build.sh` 所在目录的位置不能变）：
+
+```
+<repo>/
+├── NDK/                     # Android NDK，解压到 <repo>/NDK
+└── code/QDBI/
+    ├── usr/                 # QBDI：解压 QBDI-0.12.1-android-AARCH64.tar.gz，应得到 local/ 子目录
+    ├── frida-gum-devkit/    # frida-gum：解压后 frida-gum.h / libfrida-gum.a 在顶层
+    ├── trace.js             # Frida 驱动脚本（部署用）
+    └── trace/               # 本 agent 源码（README 所在目录）
+```
+
+```bash
+# QBDI（解压出 local/）
+mkdir -p code/QBDI/usr
+tar xzf QBDI-0.12.1-android-AARCH64.tar.gz -C code/QBDI/usr
+
+# frida-gum devkit（frida-gum.h、libfrida-gum.a 落在顶层）
+mkdir -p code/QBDI/frida-gum-devkit
+tar xJf frida-gum-devkit-<ver>-android-arm64.tar.xz -C code/QBDI/frida-gum-devkit
+
+# NDK（解压后按需重命名为 NDK）
+unzip android-ndk-r29-linux.zip
+```
+
+不想按这个布局放的话，用环境变量 `NDK` / `QDBI_HOME` / `FRIDA_INC` / `FRIDA_LIB` 覆盖，见下节。
 
 ## 编译
 
