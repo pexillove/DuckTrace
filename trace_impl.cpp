@@ -389,6 +389,13 @@ static QBDI::VMAction trace_preinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr,
 			ci.disasm = ci.disasm.substr(start);
 		}
 	}
+	// capstone 反汇编 mnemonic 与操作数之间恒有一个 tab，会把 TSV 列拆碎（有/无操作数 → 7/8 列）。
+	// find 找到即替换（tab 在 mnemonic 后第 3-5 个字符，提前退出，免整串扫描），
+	// 配合输出端双引号，整条汇编恒为一个字段，列数稳定为 7。
+	size_t tab = ci.disasm.find('\t');
+	if (tab != std::string::npos) {
+		ci.disasm[tab] = ' ';
+	}
 	ci.memBase = 0;
 	ci.haveMemBase = false;
 
@@ -487,9 +494,10 @@ static QBDI::VMAction trace_postinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr
 		ts->syscallNotes.erase(sIt);
 	}
 
+	// 汇编套双引号：整条恒为一个字段；引号由格式串直接产出，不另建 string（热路径免堆分配）
 	char raw_line[2048];
 	Buf line(raw_line, sizeof(raw_line));
-	line.appendf("%llx\t0x%-12llx\t0x%-8llx\t%-40s\t%-28s\t%-28s\t%s",
+	line.appendf("%llx\t0x%-12llx\t0x%-8llx\t\"%s\"\t%-28s\t%-28s\t%s",
 		(unsigned long long)ci.lineNum,
 		(unsigned long long)inst->address,
 		(unsigned long long)ci.offset,
