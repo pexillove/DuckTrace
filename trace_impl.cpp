@@ -748,10 +748,11 @@ static uint64_t executeWithQBDI(void *targetAddress, QBDI::GPRState *gpr, QBDI::
 	vm->recordMemoryAccess(QBDI::MEMORY_READ_WRITE);
 
 	// ---- 开始标记 ----
-	write_trace_marker("=== Trace Start: %s+0x%llx%s ===",
-		ts.moduleName.c_str(),
-		(unsigned long long)((uint64_t)(uintptr_t)targetAddress - ts.baseAddr),
-		g_trace_range_size ? "" : " (full module)");
+	// write_trace_marker("=== Trace Start: %s+0x%llx%s ===",
+	// 	ts.moduleName.c_str(),
+	// 	(unsigned long long)((uint64_t)(uintptr_t)targetAddress - ts.baseAddr),
+	// 	g_trace_range_size ? "" : " (full module)");
+	
 	LOGI("=== Trace Start: %s+0x%llx%s ===",
 		ts.moduleName.c_str(),
 		(unsigned long long)((uint64_t)(uintptr_t)targetAddress - ts.baseAddr),
@@ -769,7 +770,8 @@ static uint64_t executeWithQBDI(void *targetAddress, QBDI::GPRState *gpr, QBDI::
 	uint64_t ret = vmGpr->x0;
 
 	// ---- 结束标记 + 返回值 ----
-	write_trace_marker("=== Trace End, return 0x%llx%s ===", (unsigned long long)ret, ok ? "" : " (stopped early)");
+	// write_trace_marker("=== Trace End, return 0x%llx%s ===", (unsigned long long)ret, ok ? "" : " (stopped early)");
+
 	LOGI("=== Trace End, return 0x%llx%s ===", (unsigned long long)ret, ok ? "" : " (stopped early)");
 
 	// 把最终状态写回调用方（Frida 上下文 / vmtrace_call 用）
