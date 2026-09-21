@@ -245,20 +245,52 @@ static void mark_module_regions(const std::vector<MapRegion> &regions,
 	if (soPath.empty()) {
 		return;
 	}
+	// 一趟 walk 分不清「内部匿名页」和「模块结束」：真机上 .rodata 与 .data 之间会
+	// 夹一个可读的匿名 relro 页（GOT），再夹 ---p padding，光靠单条判据要么在这里
+	// break（丢掉后面的 .data/.bss），要么误吃后面无关的堆。所以拆两步——
+	//
+	// 第一步：定出模块的文件映射范围。从锚点地址连续往后走，只有遇到「另一个文件
+	// 映射」（非匿名且路径不同，如相邻 so、keva 文件）或地址断层才算出界；中间夹的
+	// 匿名页（relro / ---p 空洞）一律算模块内部。记下最后一个 soPath 段（通常 .data）。
+	size_t lastSo = anchor;
 	uint64_t prevEnd = 0;
 	for (size_t i = anchor; i < regions.size(); i++) {
 		const MapRegion &r = regions[i];
 		if (prevEnd != 0 && r.start != prevEnd) {
-			break; // 地址断层：已经走出这个模块
+			break; // 地址断层：出界
 		}
 		if (r.path == soPath) {
+			lastSo = i;
+		} else if (!r.anon()) {
+			break; // 另一个文件映射：出界
+		}
+		// 其余是模块内部的匿名页（relro / ---p 空洞），继续往后扫
+		prevEnd = r.end;
+	}
+
+	// 第二步：范围内落盘。soPath 段、以及「有内容的内部匿名页」（relro GOT）都收；
+	// ---p 空洞读不了，留空。
+	for (size_t i = anchor; i <= lastSo; i++) {
+		const MapRegion &r = regions[i];
+		if (r.path == soPath) {
 			kinds[i] = KIND_SO;
-		} else if (!r.readable() && !r.writable() && !r.exec()) {
-			// ---p 空洞（linker 的 RELRO / 页对齐 padding）：没内容可读，跳过但
-			// 继续往后走。这里若 break，后面的 .data/.bss 会被整段漏掉，而
-			// VMP 的 dispatch table 恰恰常驻 .data。
-		} else if (r.anon() && r.path != "[stack]" && r.writable() && !r.exec()) {
+		} else if (r.readable()) {
+			kinds[i] = KIND_SO;
+		}
+	}
+
+	// .data 之后紧跟的一串匿名 rw-p = .bss（Android 命名 [anon:.bss]）；中间可能还夹
+	// ---p padding，放行；遇到别的文件映射（keva 等）才停。
+	prevEnd = regions[lastSo].end;
+	for (size_t i = lastSo + 1; i < regions.size(); i++) {
+		const MapRegion &r = regions[i];
+		if (r.start != prevEnd) {
+			break; // 断层：.bss 结束
+		}
+		if (r.anon() && r.writable() && !r.exec()) {
 			kinds[i] = KIND_SO_BSS;
+		} else if (!r.readable() && !r.writable() && !r.exec()) {
+			// ---p padding：跳过继续找 .bss
 		} else {
 			break;
 		}
