@@ -16,6 +16,7 @@
  */
 
 #include "trace_impl.h"
+#include "mem_dump.h"
 #include "raw_logger.h"
 
 #include <android/log.h>
@@ -59,6 +60,55 @@ static std::mutex g_loggers_mutex;
 // trace 记录范围（字节数）。0 = 不限（记录目标函数所在模块全部执行流）
 static uint64_t g_trace_range_size = 0;
 
+// 内存快照开关（VMTRACE_DUMP_*）。默认全开：trace 开始前 dump 一次，
+// 回放端靠它重建执行前的内存布局。置 0 关闭。
+static int g_mem_dump_flags = VMTRACE_DUMP_ALL;
+
+// 最近一次 trace 的模块信息，供 vmtrace_dump_memory 手动 dump 时定位目标 so
+static uint64_t g_last_module_base = 0;
+static std::string g_last_module_path;
+
+// 已经自动 dump 过一次。默认只 dump 第一次 trace：hook 点在循环里被调上千次时，
+// 每次一份全量快照会瞬间撑爆磁盘，而回放要的初始内存状态第一次就取全了。
+// 要每次都 dump 就加 VMTRACE_DUMP_EVERY_RUN。
+static std::atomic<bool> g_mem_dumped{ false };
+
+// 最近一次 trace 的调用方 sp（app 线程栈），供延迟到 unhook 的 end dump 定位栈区段
+static uint64_t g_last_orig_sp = 0;
+
+// end 快照还欠着。end 那份的意义是和 start 做差异（字节码是不是执行期间才解密/改写的），
+// 所以它必须落在**最后一次** trace 之后；而「哪次是最后一次」运行期判断不出来，
+// 于是推迟到 trace once 自动摘钩 / unhook / cleanup 时再补。
+// 拿第一次调用的 end 去 diff，会安静地得出「没变化」的错误结论。
+static std::atomic<bool> g_mem_end_pending{ false };
+
+// trace 期间被读写过的内存桶（MEM_DUMP_HOT_BUCKET 对齐）。dump 时命中的区段优先
+// 落盘且豁免单区段上限——VMP 的字节码和 dispatch table 必然落在这些桶里。
+// 只在 QBDI 回调里写，而整个 trace 在 g_exec_mutex 下单线程执行，故不加锁。
+static std::vector<uint64_t> g_hot_buckets;
+static uint64_t g_hot_last = ~0ULL; // 连续访问同一桶的快速路径
+
+static void record_hot_bucket(uint64_t addr)
+{
+	uint64_t b = addr & ~(MEM_DUMP_HOT_BUCKET - 1);
+	if (b == g_hot_last) {
+		return;
+	}
+	g_hot_last = b;
+	for (uint64_t v : g_hot_buckets) {
+		if (v == b) {
+			return;
+		}
+	}
+	if (g_hot_buckets.size() < 1024) { // 兜底：访问异常散乱时不至于把表撑爆
+		g_hot_buckets.push_back(b);
+	}
+}
+
+// 定义在「专用大栈」一节之后（要用到 g_trace_stack_top）
+static void emit_mem_dump(const char *tag, uint64_t origSp, uint64_t vmSp);
+static void flush_pending_end_dump();
+
 static std::string get_process_data_dir()
 {
 	char cmdline[256] = { 0 };
@@ -82,6 +132,15 @@ static std::string getFilename(const std::string &path)
 	return pos == std::string::npos ? path : path.substr(pos + 1);
 }
 
+// 实际输出目录：未显式设置时落到 /data/data/<包名>/files/trace_logs
+static std::string trace_output_dir()
+{
+	if (!g_output_dir.empty()) {
+		return g_output_dir;
+	}
+	return get_process_data_dir() + "/files/trace_logs";
+}
+
 static void init_trace_logs_locked()
 {
 	if (g_loggers_inited) {
@@ -97,10 +156,7 @@ static void init_trace_logs_locked()
 		g_bl_logger = new RawMemoryLogger();
 	}
 
-	std::string dir = g_output_dir;
-	if (dir.empty()) {
-		dir = get_process_data_dir() + "/files/trace_logs";
-	}
+	std::string dir = trace_output_dir();
 	mkdir(dir.c_str(), 0755);
 
 	int ok = 0;
@@ -514,6 +570,7 @@ static QBDI::VMAction trace_postinst(QBDI::VMInstanceRef vm, QBDI::GPRState *gpr
 	for (const auto &a : accesses) {
 		uint64_t addr = a.accessAddress & 0xFFFFFFFFFFFFULL;
 		const char *rw = (a.type == QBDI::MEMORY_READ) ? "r" : "w";
+		record_hot_bucket(addr); // 供内存快照按「trace 真碰过」排预算优先级
 
 		// 基址分解：base 取地址操作数 PRE 值，diff = 访问地址 - base
 		uint64_t base = ci.haveMemBase ? ci.memBase : 0;
@@ -747,6 +804,22 @@ static uint64_t executeWithQBDI(void *targetAddress, QBDI::GPRState *gpr, QBDI::
 	vm->addMnemonicCB("SVC", QBDI::PREINST, trace_svc, &ts, QBDI::PRIORITY_DEFAULT);
 	vm->recordMemoryAccess(QBDI::MEMORY_READ_WRITE);
 
+	// ---- 内存快照（run 之前）----
+	// 回放的起点：目标 so 的运行期映射 + 匿名代码/数据 + 栈。
+	// 此刻 vmGpr->sp 已指向 QBDI 虚拟栈，origSp 还是 app 线程栈，两块都要覆盖
+	//（函数参数、调用方栈帧在 app 栈上，回放时缺了就跑不起来）。
+	// 模块信息每次都记：start 这次可能跳过了，但延迟到 unhook 的 end 还要用
+	g_last_module_base = ts.baseAddr;
+	g_last_module_path = info.dli_fname ? info.dli_fname : "";
+	g_last_orig_sp = origSp;
+
+	bool startDump = (g_mem_dump_flags & VMTRACE_DUMP_ALL) != 0 &&
+		(!g_mem_dumped.load() || (g_mem_dump_flags & VMTRACE_DUMP_EVERY_RUN) != 0);
+	if (startDump) {
+		g_mem_dumped.store(true);
+		emit_mem_dump("start", origSp, (uint64_t)vmGpr->sp);
+	}
+
 	// ---- 开始标记 ----
 	// write_trace_marker("=== Trace Start: %s+0x%llx%s ===",
 	// 	ts.moduleName.c_str(),
@@ -768,6 +841,17 @@ static uint64_t executeWithQBDI(void *targetAddress, QBDI::GPRState *gpr, QBDI::
 
 	vmGpr = vm->getGPRState();
 	uint64_t ret = vmGpr->x0;
+
+	// ---- 内存快照（run 之后）----
+	// 和 start 那份对比，能看出字节码区在执行期间是否被改写（= 能不能静态全量解析）。
+	// EVERY_RUN 下每次都出一份；否则挂账，等最后一次 trace 结束再补（见 g_mem_end_pending）
+	if ((g_mem_dump_flags & VMTRACE_DUMP_AT_END) != 0) {
+		if ((g_mem_dump_flags & VMTRACE_DUMP_EVERY_RUN) != 0) {
+			emit_mem_dump("end", origSp, (uint64_t)vmGpr->sp);
+		} else {
+			g_mem_end_pending.store(true);
+		}
+	}
 
 	// ---- 结束标记 + 返回值 ----
 	// write_trace_marker("=== Trace End, return 0x%llx%s ===", (unsigned long long)ret, ok ? "" : " (stopped early)");
@@ -1026,6 +1110,11 @@ static void vmtrace_listener_on_enter(GumInvocationListener *listener, GumInvoca
 		if (invData != nullptr) {
 			*(uint64_t *)invData = result;
 		}
+
+		// trace once：钩子已摘，不会再有下一次，end 快照可以收尾了
+		if (hookCtx->traceOnce) {
+			flush_pending_end_dump();
+		}
 	}
 }
 
@@ -1101,12 +1190,82 @@ static void replacement_function(GumInvocationContext *context, gpointer user_da
 		uint64_t result = run_trace_on_big_stack(rc);
 		cpuCtx->x[0] = result;
 		LOGI("replace return 0x%llx", (unsigned long long)result);
+
+		// trace once：钩子已还原，不会再有下一次，end 快照可以收尾了
+		if (hookCtx->traceOnce) {
+			flush_pending_end_dump();
+		}
 	}
 }
 
 // ============================================================================
 // 公开 API
 // ============================================================================
+
+// 填充每次 dump 都一样的部分：模块信息、热区、要排除的 trace 脚手架内存
+static void fill_dump_common(MemDumpRequest &req)
+{
+	req.moduleBase = g_last_module_base;
+	req.modulePath = g_last_module_path;
+	req.hotPages = g_hot_buckets;
+	req.line = g_line_num.load();
+	// trace 自身的 8MB 专用栈是工具的脚手架，不是目标进程状态。不排除的话它会被
+	// 当成 anon-rw 整块 dump，白吃 8MB 预算，还会往回放的内存布局里掺假。
+	if (g_trace_stack_top != 0) {
+		req.excludes.push_back({ g_trace_stack_top - kTraceStackSize, g_trace_stack_top });
+	}
+}
+
+static void emit_mem_dump(const char *tag, uint64_t origSp, uint64_t vmSp)
+{
+	MemDumpRequest req;
+	req.flags = g_mem_dump_flags & VMTRACE_DUMP_ALL;
+	if (req.flags == 0) {
+		return;
+	}
+	fill_dump_common(req);
+	req.stacks = { origSp, vmSp };
+	req.tag = tag;
+	mem_dump_run(trace_output_dir(), req);
+}
+
+// 补上挂账的 end 快照。在「确定不会再有下一次 trace」的时刻调用：
+// trace once 自动摘钩之后、unhook、cleanup。CAS 保证只出一份。
+static void flush_pending_end_dump()
+{
+	bool expected = true;
+	if (!g_mem_end_pending.compare_exchange_strong(expected, false)) {
+		return;
+	}
+	// 此刻已不在 hook 里，只有上次 trace 的 app 栈 sp 可用（QBDI 虚拟栈已释放）
+	emit_mem_dump("end", g_last_orig_sp, 0);
+}
+
+int vmtrace_set_mem_dump(int flags)
+{
+	g_mem_dump_flags = flags;
+	g_mem_dumped.store(false); // 重新配置 = 重新给一次自动 dump 的机会
+	return 0;
+}
+
+int vmtrace_set_mem_dump_limit(uint64_t perRegion, uint64_t total)
+{
+	mem_dump_set_limits(perRegion, total);
+	return 0;
+}
+
+int vmtrace_dump_memory(const char *tag)
+{
+	MemDumpRequest req;
+	// 手动 dump 时开关可能是关的，此时按全量走（调用方显式要了这一次）
+	int flags = g_mem_dump_flags & VMTRACE_DUMP_ALL;
+	req.flags = (flags != 0) ? flags : VMTRACE_DUMP_ALL;
+	fill_dump_common(req);
+	// 当前线程栈：拿本帧地址定位所在区段（没跑过 trace 时也能 dump 到栈）
+	req.stacks = { (uint64_t)(uintptr_t)__builtin_frame_address(0) };
+	req.tag = (tag != nullptr && tag[0] != '\0') ? tag : "manual";
+	return mem_dump_run(trace_output_dir(), req);
+}
 
 static HookContext *make_hook_context(void *targetAddress, const char *logTag, int useQBDI, int traceOnce)
 {
@@ -1204,6 +1363,7 @@ int vmtrace_unhook(void *targetAddress)
 	gum_interceptor_revert(g_interceptor, targetAddress);
 	gum_interceptor_flush(g_interceptor);
 	delete hookCtx;
+	flush_pending_end_dump(); // 摘钩 = 这个目标不会再 trace，补上 end 快照
 	LOGI("hook removed %p", targetAddress);
 	return 0;
 }
@@ -1313,6 +1473,7 @@ int64_t vmtrace_call(void *targetAddress, int64_t args, int argNum, const char *
 void vmtrace_cleanup(void)
 {
 	vmtrace_unhook_all();
+	flush_pending_end_dump(); // 没挂钩子直接 vmtrace_call 的路径，兜底补 end
 	{
 		std::lock_guard<std::mutex> lock(g_loggers_mutex);
 		if (g_raw_logger != nullptr) {

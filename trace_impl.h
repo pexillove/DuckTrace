@@ -27,6 +27,33 @@ int vmtrace_set_output_dir(const char *dir);
 int vmtrace_set_function_size(uint64_t size);
 
 // ============================================================================
+// 内存快照（面向 unidbg 回放）
+// ============================================================================
+
+// dump 类别位掩码
+#define VMTRACE_DUMP_MAPS 0x01 // /proc/self/maps 原始快照
+#define VMTRACE_DUMP_TARGET_SO 0x02 // 目标 so 的运行期映射（含 .bss）
+#define VMTRACE_DUMP_ANON_EXEC 0x04 // 匿名可执行段（JIT / 解密出的代码）
+#define VMTRACE_DUMP_ANON_RW 0x08 // 匿名可写段（堆 / 运行期数据）
+#define VMTRACE_DUMP_STACK 0x10 // 栈（app 线程栈 + QBDI 虚拟栈，只取 sp 之上）
+#define VMTRACE_DUMP_ALL 0x1f
+#define VMTRACE_DUMP_AT_END 0x100 // 额外出一份 end 快照，和 start 做差异（见下）
+// 说明：end 那份落在「最后一次 trace 之后」——trace once 自动摘钩、vmtrace_unhook
+// 或 vmtrace_cleanup 时补。加了 EVERY_RUN 则每次 trace 各出一份 end。
+#define VMTRACE_DUMP_EVERY_RUN 0x200 // 每次 trace 都 dump（默认只 dump 第一次，防止循环 hook 刷爆磁盘）
+
+// 设置 dump 类别。默认 VMTRACE_DUMP_ALL（trace 开始前 dump 一次）。
+// 传 0 关闭。输出到 <输出目录>/mem/，格式见 docs/TraceFormat.md。
+int vmtrace_set_mem_dump(int flags);
+
+// dump 上限（字节）。perRegion：单区段超过就整段跳过（默认 32MB，目标 so 段不受限）；
+// total：单次 dump 总预算（默认 512MB）。0 = 不限。
+int vmtrace_set_mem_dump_limit(uint64_t perRegion, uint64_t total);
+
+// 手动触发一次 dump（不依赖 hook），tag 为子目录名，NULL = "manual"
+int vmtrace_dump_memory(const char *tag);
+
+// ============================================================================
 // Hook 管理
 // ============================================================================
 

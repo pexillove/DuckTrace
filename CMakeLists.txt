@@ -39,6 +39,7 @@ set_target_properties(frida-gum PROPERTIES
 add_library(trace SHARED
     trace_impl.cpp
     raw_logger.cpp
+    mem_dump.cpp
 )
 
 target_include_directories(trace PRIVATE

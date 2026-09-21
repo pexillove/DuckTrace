@@ -83,6 +83,7 @@ echo "[*] OUT        = $OUT"
     -I"$FRIDA_INC" \
     "$SCRIPT_DIR/trace_impl.cpp" \
     "$SCRIPT_DIR/raw_logger.cpp" \
+    "$SCRIPT_DIR/mem_dump.cpp" \
     "$FRIDA_LIB" \
     -L"$QBDI_LIB" -lQBDI \
     -llog -ldl -lm -lc -landroid \

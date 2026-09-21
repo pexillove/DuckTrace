@@ -22,6 +22,7 @@
 |------|------|
 | `trace_impl.{h,cpp}` | QBDI + Frida Gum 核心实现 |
 | `raw_logger.{h,cpp}` | code/rw/bl 三文件 mmap 缓存写入器 |
+| `mem_dump.{h,cpp}` | 内存快照：maps + 目标 so 运行期映射 + 匿名段 + 栈 |
 | `syscall_names.inc` | AArch64 syscall 名字表（从 NDK `asm/unistd_64.h` 生成） |
 | `build.sh` | NDK 交叉编译（主构建路径） |
 | `CMakeLists.txt` | CMake 构建（可选） |
@@ -78,6 +79,7 @@ grep "#define __NR_" $NDK/sysroot/usr/include/aarch64-linux-android/asm/unistd_6
 │           ├── CMakeLists.txt         # 可选 CMake 构建
 │           ├── trace_impl.{h,cpp}     # QBDI + Frida Gum 核心实现
 │           ├── raw_logger.{h,cpp}     # code/bl/rw 三文件 mmap 写入器
+│           ├── mem_dump.{h,cpp}       # 内存快照（maps + so 映射 + 匿名段 + 栈）
 │           ├── syscall_names.inc      # AArch64 syscall 名表
 │           ├── trace.js               # Frida 驱动脚本（部署用）
 │           ├── README.md
@@ -129,7 +131,8 @@ adb pull /data/data/<包名>/files/trace_logs/ .
 ```
 
 `trace.js` 里改 `MODULE_NAME` / `FUNCTION_OFFSET`；`FUNCTION_SIZE` 限定 trace 记录范围
-（0 = 整模块执行流，否则只追 `[入口, 入口+size)`）；`TRACE_DIR` 留空用应用数据目录。
+（0 = 整模块执行流，否则只追 `[入口, 入口+size)`）；`TRACE_DIR` 留空用应用数据目录；
+`DUMP_FLAGS` 控制内存快照（默认全开，`0` 关闭）。
 每次 trace 的三文件首尾都有标记行：
 
 ```
@@ -200,10 +203,49 @@ hex行号\tr|w\t0x基址±0x偏移
 grep -P "^4ee\t" rw.log   # 第 0x4ee 条指令的内存访问
 ```
 
+### mem/ — 内存快照（unidbg 回放用）
+
+默认取两份：**start**（第一次 trace 前）和 **end**（最后一次 trace 后）。回放端靠
+start 重建初始内存布局；两份一 diff 就能看出哪些内存是执行期间才被解密/改写的——
+壳解出来的字节码常常就藏在这个差异里。
+
+```
+mem/
+├── index.tsv            # 清单，12 列：tag line start end rva prot type dump_start dump_size file path note
+├── 00_start_maps.txt    # /proc/self/maps 原样快照
+├── 00_start/            # 各区段原始内容，<dump_start>-<dump_end>.bin
+├── 01_end_maps.txt
+└── 01_end/
+```
+
+`index.tsv` 每次 dump 前追加一行 `#dump tag=… seq=… line=… module_base=0x… module=…`，
+`module_base` 是目标 so 这次的加载基址（RVA 锚点，绝对地址会被 ASLR 漂掉）。
+
+`type` 列：`so` / `so-bss`（目标 so 的运行期映射，已重定位/已解密）、`anon-x`（匿名
+`r-xp`/`rwxp`，JIT 或壳解出来的代码）、`anon-rw`（匿名 `rw-p`，堆/运行期数据）、
+`stack`（app 线程栈 + QBDI 虚拟栈，只取 `sp` 之上）。
+
+blob 文件偏移与区段偏移 1:1（读不到的页补零，`note` 记 `zero_pages`），回放端把整个
+文件映射到 `dump_start` 即可。超上限的区段**整段跳过不截断**，`note` 记 `skip`。
+trace 期间 `rw.log` 真访问过的区段 `note` 记 `{"hot":"1"}`，优先落盘且不受单区段上限约束。
+
+```bash
+column -t -s $'\t' mem/index.tsv | less -S              # 看清单
+awk -F'\t' '$1=="start" && $7 ~ /so/' mem/index.tsv     # 只看 start 快照里目标 so 的段
+awk -F'\t' '$12 ~ /hot/' mem/index.tsv                  # 只看 trace 真碰过的区段
+```
+
+完整规范（含 `note` 全部取值、回放端解析示例）见 `docs/TraceFormat.md`。
+
 ## 导出 API
 
 - `vmtrace_set_output_dir(dir)` — 覆盖输出目录（默认 `files/trace_logs`）
 - `vmtrace_set_function_size(size)` — 限定 trace 记录范围（0 = 整模块执行流）
+- `vmtrace_set_mem_dump(flags)` — 内存快照类别位掩码（默认 `VMTRACE_DUMP_ALL`，0 = 关闭）；
+  加 `VMTRACE_DUMP_AT_END` 在**最后一次** trace 之后再 dump 一份（供 start/end 差异），
+  加 `VMTRACE_DUMP_EVERY_RUN` 每次 trace 各出一对
+- `vmtrace_set_mem_dump_limit(perRegion, total)` — 单区段 / 单次 dump 上限（默认 32MB / 512MB，0 = 不限）
+- `vmtrace_dump_memory(tag)` — 手动触发一次 dump，`tag` 作子目录名
 - `vmtrace_hook_attach(target, tag, useQBDI, traceOnce)` — attach 模式
 - `vmtrace_hook_replace(target, tag, useQBDI, traceOnce)` — replace 模式（无重复副作用）
 - `vmtrace_unhook` / `vmtrace_unhook_all`
@@ -219,6 +261,12 @@ grep -P "^4ee\t" rw.log   # 第 0x4ee 条指令的内存访问
 - SVC 指令 QBDI 无法执行，已注册 mnemonic 回调兜底（原生执行）；同时在
   PREINST 读 `x8`(syscall 号)+`x0-x5`(参数) 生成 JSON 注解，放在 code.log 的
   SVC 行第 7 列（note），如 `{"syscall":"read","args":["0x1","0x7fd...","0x40"]}`。
+- **内存快照默认只取一对 start/end**：start 落在第一次 trace 前，end 落在最后一次
+  trace 后（`traceOnce` 自动 detach / `vmtrace_unhook` / `vmtrace_cleanup` 三处兜底）。
+  hook 点若在循环里被调上千次，每次一份全量快照会瞬间撑爆磁盘，而回放要的初始内存
+  状态第一次就取全了。要每次 trace 各出一对得显式加 `VMTRACE_DUMP_EVERY_RUN`。
+- **读内存一律走 `process_vm_readv`**：踩到 guard page / `PROT_NONE` 只是返回错误，
+  直接 `memcpy` 会把进程打挂。
 - **专用大栈**：目标函数被调用时 app 线程栈往往已近耗尽（真机实测 hook 点仅剩
   ~0x60-0x110 字节余量），trace 机制自身的 C++ 栈帧会把栈顶穿 guard page 崩掉。
   因此整个 trace worker 用 `trace_run_on_stack`（AArch64 asm thunk）切到 8MB 专用栈，

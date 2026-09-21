@@ -18,11 +18,32 @@
 //   TRACE_ONCE      true = 只 trace 一次后自动 detach
 //   TRACE_DIR       输出目录 (设备端)。留空 = 用应用数据目录
 //                   /data/data/<包名>/files/trace_logs (与 gum.cpp 一致)
+//   DUMP_FLAGS      内存快照类别 (位掩码, 见下)。0 = 关闭
+//                   默认只在第一次 trace 前 dump 一份, 输出到 <输出目录>/mem/
+//   DUMP_PER_REGION 单区段上限 (字节), 超过整段跳过。目标 so 段不受限
+//   DUMP_TOTAL      单次 dump 总预算 (字节)
 
 var MODULE_NAME = "libksxgs.so";            // TODO: 改成目标 so
 var FUNCTION_OFFSET = 0x27a2c;              // TODO: 改成目标函数偏移
 var TRACE_ONCE = true;
 var TRACE_DIR = "";
+
+// 内存快照 (unidbg 回放用): maps + 目标 so 运行期映射 + 匿名 r-xp/rwxp +
+// 匿名 rw-p + 栈。DUMP_ALL 已是常用组合, 按需再加 AT_END / EVERY_RUN。
+var DUMP_MAPS = 0x01;       // /proc/self/maps 原始快照
+var DUMP_TARGET_SO = 0x02;  // 目标 so 的运行期映射 (已重定位/已解密, 含 .bss)
+var DUMP_ANON_EXEC = 0x04;  // 匿名可执行段 (JIT / 壳解出来的代码)
+var DUMP_ANON_RW = 0x08;    // 匿名可写段 (堆 / 运行期数据)
+var DUMP_STACK = 0x10;      // 栈 (app 线程栈 + QBDI 虚拟栈, 只取 sp 之上)
+var DUMP_ALL = 0x1f;
+var DUMP_AT_END = 0x100;    // 额外出一份 end 快照 (落在最后一次 trace 之后), 与 start 差异
+var DUMP_EVERY_RUN = 0x200; // 每次 trace 都 dump (默认只第一次, 防止循环 hook 刷爆磁盘)
+
+// 默认带 AT_END: 只有 start/end 两份快照都在, 才能差异出「哪些内存是执行期间
+// 才被改写/解密的」——壳解出来的字节码常常就藏在这个差异里
+var DUMP_FLAGS = DUMP_ALL | DUMP_AT_END;
+var DUMP_PER_REGION = 32 * 1024 * 1024;
+var DUMP_TOTAL = 512 * 1024 * 1024;
 
 var QBDI_SO_PATH = "/data/local/tmp/libQBDI.so";
 var TRACE_SO_PATH = "/data/local/tmp/libtrace.so";
@@ -60,7 +81,19 @@ function trace() {
 		}
 	}
 
-	// 4. 定位目标函数
+	// 4. 配置内存快照
+	var setDump = new NativeFunction(
+		libtrace.getExportByName("vmtrace_set_mem_dump"), "int", ["int"]);
+	setDump(DUMP_FLAGS);
+	if (DUMP_FLAGS !== 0) {
+		var setDumpLimit = new NativeFunction(
+			libtrace.getExportByName("vmtrace_set_mem_dump_limit"),
+			"int", ["uint64", "uint64"]);
+		setDumpLimit(DUMP_PER_REGION, DUMP_TOTAL);
+		console.log("[*] 内存快照: flags=0x" + DUMP_FLAGS.toString(16) + " -> <输出目录>/mem/");
+	}
+
+	// 5. 定位目标函数
 	var base = Module.findBaseAddress(MODULE_NAME);
 	if (base === null) {
 		console.log("[!] 模块未加载: " + MODULE_NAME);
@@ -68,7 +101,7 @@ function trace() {
 	}
 	var target = base.add(FUNCTION_OFFSET);
 
-	// 5. attach hook 启动 trace
+	// 6. attach hook 启动 trace
 	var attach = new NativeFunction(
 		libtrace.getExportByName("vmtrace_hook_attach"),
 		"int", ["pointer", "pointer", "int", "int"]);
