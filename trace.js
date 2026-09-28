@@ -23,8 +23,8 @@
 //   DUMP_PER_REGION 单区段上限 (字节), 超过整段跳过。目标 so 段不受限
 //   DUMP_TOTAL      单次 dump 总预算 (字节)
 
-var MODULE_NAME = "libksxgs.so";            // TODO: 改成目标 so
-var FUNCTION_OFFSET = 0x27a2c;              // TODO: 改成目标函数偏移
+var MODULE_NAME = "libmetasec_ml.so"; // TODO: 改成目标 so
+var FUNCTION_OFFSET = 0x2e01b8; // TODO: 改成目标函数偏移
 var TRACE_ONCE = true;
 var TRACE_DIR = "";
 
@@ -112,4 +112,53 @@ function trace() {
 		TRACE_ONCE + ") => " + ret);
 }
 
-// trace();
+// 目标 so 一被 dlopen 出来就开跑；已经加载了就直接跑
+function onSoLoaded(name, callback) {
+	if (Module.findBaseAddress(name) !== null) {
+		console.log("[*] " + name + " 已加载，直接 trace");
+		setImmediate(callback);
+		return;
+	}
+
+	var fired = false;
+	var watchers = [];
+
+	function fire() {
+		if (fired) return;
+		fired = true;
+		watchers.forEach(function (w) {
+			try { w.detach(); } catch (e) {}
+		});
+		console.log("[*] 检测到 " + name + " 加载完成，开始 trace");
+		// 不在 dlopen 回调里直接干活，交回事件循环，避开加载器锁
+		setImmediate(callback);
+	}
+
+	// Android 走 android_dlopen_ext，其它情况退回 dlopen
+	["android_dlopen_ext", "dlopen"].forEach(function (sym) {
+		var addr = Module.findExportByName(null, sym);
+		if (addr === null) return;
+		watchers.push(Interceptor.attach(addr, {
+			onEnter: function (args) {
+				try {
+					var path = args[0].readCString();
+					if (path !== null && path.indexOf(name) !== -1) this.hit = true;
+				} catch (e) {}
+			},
+			onLeave: function (retval) {
+				if (this.hit) fire();
+			}
+		}));
+	});
+
+	if (watchers.length === 0) {
+		console.log("[!] 找不到 dlopen/android_dlopen_ext，直接尝试 trace");
+		fire();
+	}
+}
+
+function main() {
+	onSoLoaded(MODULE_NAME, trace);
+}
+
+setImmediate(main);

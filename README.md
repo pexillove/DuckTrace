@@ -133,13 +133,9 @@ adb pull /data/data/<包名>/files/trace_logs/ .
 `trace.js` 里改 `MODULE_NAME` / `FUNCTION_OFFSET`；`FUNCTION_SIZE` 限定 trace 记录范围
 （0 = 整模块执行流，否则只追 `[入口, 入口+size)`）；`TRACE_DIR` 留空用应用数据目录；
 `DUMP_FLAGS` 控制内存快照（默认全开，`0` 关闭）。
-每次 trace 的三文件首尾都有标记行：
-
-```
-=== Trace Start: libtwo.so+0xc70 (full module) ===
-...
-=== Trace End, return 0x1f ===
-```
+会话起止标记（`=== Trace Start: ... ===` / `=== Trace End, return 0x... ===`）
+**只输出到 logcat，不写进三文件**——`write_trace_marker` 的调用点已注释掉，只剩 `LOGI`。
+所以日志文件里没有注释行，解析时不需要跳过任何东西。
 
 logcat 过滤用 `duck` 标签（`adb logcat -s duck` 或 `adb logcat | grep duck`）。
 
@@ -150,13 +146,17 @@ logcat 过滤用 `duck` 标签（`adb logcat -s duck` 或 `adb logcat | grep duc
 ### code.log — 主指令流（恒 7 列 TSV）
 
 ```
-hex行号\t绝对地址\t模块偏移\t"汇编指令"\tR{JSON}\tW{JSON}\tsvc{JSON}
+hex行号\t绝对地址\t模块偏移\t"汇编指令"\t{读寄存器}\t{写寄存器}\t{note}
 ```
 
 - 汇编列带双引号、**恒为单个字段**（反汇编内部 mnemonic 与操作数之间的 tab 已替换为空格，不会拆列）
-- `R` 是执行前（PRE）值，`W` 是执行后（POST）值；`w` 寄存器已截断为低 32 位
-- 最后三列都是合法 JSON，可直接 `json.loads`；地址/偏移/R/W/note 各列带对齐填充空格，汇编列不带
-- 文件首行 `=== Trace Start: ... ===` 为注释行，解析时跳过
+- 第 5 列是执行前（PRE）值，第 6 列是执行后（POST）值；`W` 寄存器是低 32 位
+- 第 5/6/7 列都是合法 JSON 对象，可直接 `json.loads`（第 4 列本身是 JSON 字符串）
+- **补宽（最小宽度，超长溢出）**：地址补到 14、偏移补到 10、读/写列各补到 28；
+  **汇编列和 note 列不补宽**
+- 寄存器键名**全大写**（`X0`/`W27`/`SP`/`FP`/`LR`/`Q0`…，直接来自 QBDI 的 `regName`）
+- 行号从 0 起**连续无空洞**：行号 == 第 N 条指令，不是"恰好唯一的编号"
+- 文件里**没有** `=== Trace Start ===` 之类的注释行（见上）
 
 ```bash
 grep -P "^4ee\t" code.log   # 第 0x4ee 条指令
@@ -164,29 +164,34 @@ cut -f4 code.log | tr -d '"' | awk '{print $1}' | sort | uniq -c | sort -rn  # �
 ```
 
 ```
-e	0x76ff44fb98  	0xf4b98   	"add x0, sp, #0x108"                    	{"SP":"0x6fd25e1d80"}       	{"X0":"0x6fd25e1e88"}       	{}
-f	0x76ff44fb9c  	0xf4b9c   	"movk w27, #0xc076, lsl #16"            	{"W27":"0xce4d"}            	{"W27":"0xc076ce4d"}        	{}
-10	0x76ff44fba0  	0xf4ba0   	"movk w21, #0x8ffd, lsl #16"            	{"W21":"0xf9fe"}            	{"W21":"0x8ffdf9fe"}        	{}
-11	0x76ff44fba4  	0xf4ba4   	"stur x8, [x29, #-0x60]"                	{"X8":"0x73555f635f9c96b7","FP":"0x6fd25e1fe0"}	{}                          	{}
-12	0x76ff44fba8  	0xf4ba8   	"sub sp, sp, #0x50"                     	{"SP":"0x6fd25e1d80"}       	{"SP":"0x6fd25e1d30"}       	{}
-13	0x76ff44fbac  	0xf4bac   	"stp x29, x30, [sp, #0x40]"             	{"FP":"0x6fd25e1fe0","LR":"0x7704c5ebfc","SP":"0x6fd25e1d30"}	{}                          	{}
-14	0x76ff44fbb0  	0xf4bb0   	"stp x0, x1, [sp]"                      	{"X0":"0x6fd25e1e88","X1":"0x7a0f89cf20","SP":"0x6fd25e1d30"}	{}                          	{}
-15	0x76ff44fbb4  	0xf4bb4   	"stp x2, x3, [sp, #0x10]"               	{"X2":"0x18","X3":"0x1089ec0dba","SP":"0x6fd25e1d30"}	{}                          	{}
-16	0x76ff44fbb8  	0xf4bb8   	"stp x4, x5, [sp, #0x20]"               	{"X4":"0xffffffffffffff","X5":"0x1275ce","SP":"0x6fd25e1d30"}	{}                          	{}
-17	0x76ff44fbbc  	0xf4bbc   	"stp x6, x7, [sp, #0x30]"               	{"X6":"0xd","X7":"0x799fba2378","SP":"0x6fd25e1d30"}	{}                          	{}
-18	0x76ff44fbc0  	0xf4bc0   	"bl #0x10"                              	{"SP":"0x6fd25e1d30"}       	{"LR":"0x76ff44fbc4"}       	{}
-19	0x76ff44fbd0  	0xf4bd0   	"sub sp, sp, #0x10"                     	{"SP":"0x6fd25e1d30"}       	{"SP":"0x6fd25e1d20"}       	{}
-1a	0x76ff44fbd4  	0xf4bd4   	"stp x29, x30, [sp]"                    	{"FP":"0x6fd25e1fe0","LR":"0x76ff44fbc4","SP":"0x6fd25e1d20"}	{}                          	{}
-1b	0x76ff44fbd8  	0xf4bd8   	"ldr x0, [sp, #0x8]"                    	{"SP":"0x6fd25e1d20"}       	{"X0":"0x76ff44fbc4"}       	{}
-1c	0x76ff44fbdc  	0xf4bdc   	"ldp x29, x30, [sp]"                    	{"SP":"0x6fd25e1d20"}       	{"FP":"0x6fd25e1fe0","LR":"0x76ff44fbc4"}	{}
+0	0x70cd6101b8  	0x2e01b8  	"stp x29, x30, [sp, #-0x60]!"	{"FP":"0x70528ec000","LR":"0x70bfbdeb68","SP":"0x70528ec000"}	{"SP":"0x70528ebfa0"}       	{}
+1	0x70cd6101bc  	0x2e01bc  	"stp x28, x27, [sp, #0x10]"	{"X28":"0x30","X27":"0x18","SP":"0x70528ebfa0"}	{}                          	{}
+2	0x70cd6101c0  	0x2e01c0  	"stp x26, x25, [sp, #0x20]"	{"X26":"0x733791c530","X25":"0x30","SP":"0x70528ebfa0"}	{}                          	{}
+3	0x70cd6101c4  	0x2e01c4  	"stp x24, x23, [sp, #0x30]"	{"X24":"0x480","X23":"0x70cd6101b8","SP":"0x70528ebfa0"}	{}                          	{}
+4	0x70cd6101c8  	0x2e01c8  	"stp x22, x21, [sp, #0x40]"	{"X22":"0x7317856c80","X21":"0x731785cce0","SP":"0x70528ebfa0"}	{}                          	{}
+5	0x70cd6101cc  	0x2e01cc  	"stp x20, x19, [sp, #0x50]"	{"X20":"0x72e77c9f18","X19":"0x733791b2a0","SP":"0x70528ebfa0"}	{}                          	{}
+6	0x70cd6101d0  	0x2e01d0  	"mov x29, sp"	{"SP":"0x70528ebfa0"}       	{"FP":"0x70528ebfa0"}       	{}
+7	0x70cd6101d4  	0x2e01d4  	"sub sp, sp, #0x2b0"	{"SP":"0x70528ebfa0"}       	{"SP":"0x70528ebcf0"}       	{}
+8	0x70cd6101d8  	0x2e01d8  	"mov x19, sp"	{"SP":"0x70528ebcf0"}       	{"X19":"0x70528ebcf0"}      	{}
+9	0x70cd6101dc  	0x2e01dc  	"adrp x9, #1449984"	{}                          	{"X9":"0x70cd772000"}       	{}
+a	0x70cd6101e0  	0x2e01e0  	"mov w10, #0xe905"	{}                          	{"W10":"0xe905"}            	{}
+b	0x70cd6101e4  	0x2e01e4  	"mov w4, #0x259e"	{}                          	{"W4":"0x259e"}             	{}
+c	0x70cd6101e8  	0x2e01e8  	"movk w10, #0xcdb8, lsl #16"	{"W10":"0xe905"}            	{"W10":"0xcdb8e905"}        	{}
+d	0x70cd6101ec  	0x2e01ec  	"movk w4, #0xb496, lsl #16"	{"W4":"0x259e"}             	{"W4":"0xb496259e"}         	{}
 ```
 
-### bl.log — 函数调用
+### bl.log — 外部函数调用
 
 ```
 hex行号\t目标地址\t符号名
-目标地址 - 0x10 起 0x30 字节 hexdump
+目标地址 - 0x10 起 hexdump（0~3 行）
 ```
+
+- 触发源是 `EXEC_TRANSFER_CALL`，**只在调用跳出被 trace 范围时记录**。
+  内部调用（落在目标 so 内）不在此文件里，实测 22,106 条**全部**是外部调用。
+  要完整调用图得自己扫 code.log 的 `bl` / `blr`
+- `blr` 的目标可从 code.log 该行的读列取（`"blr x8"` → 读列里的 `X8`）
+- 行号严格递增、不重复（一条指令至多一次外部调用）
 
 ```bash
 grep -P "^4ee\t" bl.log   # 第 0x4ee 条指令触发的调用
@@ -196,8 +201,16 @@ grep -P "^4ee\t" bl.log   # 第 0x4ee 条指令触发的调用
 
 ```
 hex行号\tr|w\t0x基址±0x偏移
-访问地址 - 0x10 起 0x30 字节 hexdump
+访问地址 - 0x10 起 hexdump（0~3 行）
 ```
+
+- **同一行号可有多条**（一条指令访问多块内存，`stp` 写两个地址），实测单行最多 4 条；
+  解析时要按「行号 → 条目列表」建模
+- 行号单调不减（不倒退），可按行号区间二分定位
+- `base` 是该指令第一个地址操作数的 PRE 值；没有则退化为访问地址本身（于是出现 `+0x0`）
+- ❗ **hexdump 行数不固定**：读满 `0x30` 字节是 3 行；跨区段/页边界只读到一部分时
+  行数变少，末行缺的字节补空格；整段读不到（guard page / `PROT_NONE`）时
+  **hexdump 完全消失，只剩索引行**。解析时按「读到下一个索引行为止」收集，别假定 3 行
 
 ```bash
 grep -P "^4ee\t" rw.log   # 第 0x4ee 条指令的内存访问
