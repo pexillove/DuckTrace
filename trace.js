@@ -28,6 +28,10 @@ var FUNCTION_OFFSET = 0x2e01b8; // TODO: 改成目标函数偏移
 var TRACE_ONCE = true;
 var TRACE_DIR = "";
 
+// 是否额外挂一个普通 Frida hook 打印入参/返回值（输出到控制台，不写 trace 文件）。
+// 打印内容在下面 trace() 里的 Interceptor.attach 改
+var CALL_HOOKS = true;
+
 // 内存快照 (unidbg 回放用): maps + 目标 so 运行期映射 + 匿名 r-xp/rwxp +
 // 匿名 rw-p + 栈。DUMP_ALL 已是常用组合, 按需再加 AT_END / EVERY_RUN。
 var DUMP_MAPS = 0x01;       // /proc/self/maps 原始快照
@@ -101,7 +105,33 @@ function trace() {
 	}
 	var target = base.add(FUNCTION_OFFSET);
 
-	// 6. attach hook 启动 trace
+	// 6. 普通 Frida hook：只为了在读参数/返回值，输出到控制台，不写 trace 文件
+	//    放在 vmtrace_hook_attach 之前 —— 谁后挂谁的补丁在上面，libtrace 那层
+	//    traceOnce 摘钩时会把「自己挂上去时看到的入口字节」写回去；先挂这个，
+	//    它摘钩时写回的就是我们这段 stub，后续调用还能继续打印
+	if (CALL_HOOKS) {
+		Interceptor.attach(target, {
+			onEnter: function(args) {
+				// console.log("[enter] x0=" + args[0] + " x1=" + args[1] + " x2=" + args[2] + " x3=" + args[3] + " lr=" + this.returnAddress);
+
+				// ↓↓↓ 按 IDA 里的实际类型改这里 ↓↓↓
+				try {
+					console.log("  arg0 (char*) = " + args[0].readCString());
+				} catch (e) { console.log("  arg0 不是合法字符串"); }
+			},
+			onLeave: function(retval) {
+				// console.log("[leave] ret=" + retval);
+
+				// 返回 char* 的话：
+				try {
+					console.log("  ret (char*) = " + retval.readCString());
+				} catch (e) { }
+			}
+		});
+		console.log("[*] 已挂参数/返回值 hook -> 输出在本控制台");
+	}
+
+	// 7. attach hook 启动 trace
 	var attach = new NativeFunction(
 		libtrace.getExportByName("vmtrace_hook_attach"),
 		"int", ["pointer", "pointer", "int", "int"]);
@@ -126,8 +156,8 @@ function onSoLoaded(name, callback) {
 	function fire() {
 		if (fired) return;
 		fired = true;
-		watchers.forEach(function (w) {
-			try { w.detach(); } catch (e) {}
+		watchers.forEach(function(w) {
+			try { w.detach(); } catch (e) { }
 		});
 		console.log("[*] 检测到 " + name + " 加载完成，开始 trace");
 		// 不在 dlopen 回调里直接干活，交回事件循环，避开加载器锁
@@ -135,17 +165,17 @@ function onSoLoaded(name, callback) {
 	}
 
 	// Android 走 android_dlopen_ext，其它情况退回 dlopen
-	["android_dlopen_ext", "dlopen"].forEach(function (sym) {
+	["android_dlopen_ext", "dlopen"].forEach(function(sym) {
 		var addr = Module.findExportByName(null, sym);
 		if (addr === null) return;
 		watchers.push(Interceptor.attach(addr, {
-			onEnter: function (args) {
+			onEnter: function(args) {
 				try {
 					var path = args[0].readCString();
 					if (path !== null && path.indexOf(name) !== -1) this.hit = true;
-				} catch (e) {}
+				} catch (e) { }
 			},
-			onLeave: function (retval) {
+			onLeave: function(retval) {
 				if (this.hit) fire();
 			}
 		}));
